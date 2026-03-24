@@ -1,184 +1,353 @@
-# Audit Report: Task Implementation Status
+# Audit Report -- CRM Avito AI Worker
 
-Дата аудита: 2026-03-12
-
----
-
-## 1. SPEC.md (Основная спецификация)
-
-- **Задача:** docs/SPEC.md
-- **Статус:** ✅ Реализовано
-- **Что сделано:**
-  - Webhook endpoint (`api/webhooks.py`) -- принимает new_application и new_message, idempotency через in-memory set + DB dedup
-  - Avito Auth (`services/avito_auth.py`) -- get_valid_token(account_id), refresh, client_credentials
-  - Avito Messenger (`services/avito_messenger.py`) -- send_message, get_messages, get_chat_info, retry с backoff
-  - AI Agent (`services/ai_agent.py`) -- все этапы: greeting, waiting_qualification, presentation/waiting_fork, booking/waiting_booking, alternatives, clarify, followup, handover
-  - AI Claude (`services/ai_claude.py`) -- ask_claude/call_claude с SOCKS5 proxy, логирование в ai_prompts_log, 5 retry + OpenAI fallback
-  - RAG (`services/ai_rag.py`) -- search_vacancies + Qdrant + OpenAI embeddings + geo-fallback (50 km)
-  - Message Scheduler (`services/message_scheduler.py`) -- schedule_message + process_scheduled каждые 5 сек
-  - Incoming Processor (`workers/incoming_processor.py`) -- handle_incoming с проверкой ночного окна
-  - Handover (`services/handover.py`) -- create_handover_card с генерацией ai_summary через Claude
-  - Vacancy Sync (`services/vacancy_sync.py`) -- sync_all_vacancies из Avito API в БД + Qdrant
-  - Models (`models/db.py`) -- 13 моделей: AvitoAccount, Applicant, Application, Chat, Message, AISession, HandoverCard, Vacancy, WebhookLog, AIPromptsLog, EventLog и др.
-  - Prompts -- 9 файлов: system.txt, greeting.txt, qualification.txt, presentation.txt, booking.txt, alternatives.txt, objection.txt, followup.txt, clarify.txt
-  - Config (`config.py`) -- все настройки из SPEC через pydantic-settings
-  - Два HTTP-клиента -- SOCKS5 для Claude/OpenAI, прямой для Avito
-  - APScheduler -- 5 задач: process_scheduled (5s), token refresh (30m), vacancy sync (30m), event cleanup (daily 3am), telegram summary (cron)
-  - Ночное окно -- is_night_window() в utils/time_helpers.py, проверяется в webhooks.py и incoming_processor.py
-- **Что не сделано / расхождения:**
-  - `services/segmentation.py` существует как файл, но основная логика сегментации встроена в ai_agent.py (этапы waiting_fork, alternatives). Архитектурное решение, не баг.
-  - SPEC описывает flow "qualification -> presentation -> segmentation -> followup -> handover". В коде flow расширен: greeting -> waiting_qualification -> presentation+waiting_fork -> booking/alternatives -> waiting_booking -> handover. Это улучшение.
+Data audita: 2026-03-24
 
 ---
 
-## 2. TASK-multi-account.md
+## 1. Svodnaya tablica zadach i ikh statusov
 
-- **Задача:** docs/tasks/TASK-multi-account.md
-- **Статус:** ✅ Реализовано
-- **Что сделано:**
-  - AvitoAccount -- все поля: id, account_name, client_id, client_secret, avito_user_id, access_token, token_expires_at, refresh_token, is_active, webhook_registered, telegram_topic_id, created_at, updated_at
-  - Миграция `migrations/003_multi_account.sql` -- ADD webhook_registered, ADD account_id к vacancies
-  - Маршрутизация вебхуков -- _resolve_account_by_user_id, _resolve_account_for_application (4 стратегии: user_id, vacancy_id, перебор, default)
-  - avito_auth.py -- get_valid_token(account_id), exchange_code_for_token(account_id, code)
-  - token_refresher.py -- refresh_all_active_accounts(), цикл по активным аккаунтам
-  - avito_messenger.py -- send_message(account_id, chat_id, text)
-  - avito_applications.py -- get_application_details(account_id, app_id), get_account_items(account_id, status)
-  - Фильтрация своих сообщений -- _get_all_our_user_ids() проверяет все аккаунты
-  - applications.account_id -- поле присутствует (FK), заполняется при создании
-  - Admin endpoints -- POST /admin/accounts, PUT /admin/accounts/{id}, POST /admin/accounts/{id}/register-webhooks, POST /admin/accounts/{id}/toggle
-  - config.py -- нет захардкоженных credentials, все из БД; только avito_default_account_id=1
-- **Что не сделано / расхождения:**
-  - Нет
+| # | Task | Prioritet | Status | Kommentarij |
+|---|------|-----------|--------|-------------|
+| 1 | Vacancy-Only Accounts (ai_enabled) | HIGH | DONE | ai_enabled pole v DB, migracija 007/008, proverka v webhooks/incoming_processor |
+| 2 | Web Admin Panel | MEDIUM | DONE | admin_web.py + admin.py + templates/admin.html, cookie auth, event_log |
+| 3 | Vacancy List in Admin | MEDIUM | DONE | GET /admin/api/vacancies + stats endpoint v admin.py |
+| 4 | Bitrix Agent Toggle | MEDIUM | DONE | services/bitrix_agent.py sozdana, config vars dobavleny |
+| 5 | Bitrix Line Deactivation (curl) | MEDIUM | PARTIAL | Scripty obnovleny, no CRM toggle cherez curl ne podtverzhden |
+| 6 | Dialog Edge Cases (phone, today) | HIGH | DONE | prompts/no_phone.txt, asks_phone.txt, booking.txt obnovlen, _handle_booking_response obrabotka |
+| 7 | Two Critical Bugs (duplicates + LLM errors) | HIGH | DONE | skip_db v avito_messenger, _is_llm_error + _mark_session_failed logika |
+| 8 | Fix AI Claude Retry & Timeouts | HIGH | DONE | _is_retryable(), razdelnye timeout'y (15/120/30s), OpenAI retry 3x |
+| 9 | Fix Connection Reuse | CRITICAL | DONE | _claude_client() vnutri retry loop (stroka 154 ai_claude.py) |
+| 10 | Cascade Bugs (debounce, scheduled check, fork) | CRITICAL | DONE | incoming_processor rewrite s debounce, session check v message_scheduler, fork logic fix |
+| 11 | Duplicate Messages in DB | MEDIUM | DONE | skip_db parametr v send_message, message_scheduler ispolzuet skip_db=True |
+| 12 | Fix Emulator Duplicate Phone | LOW | PARTIAL | Ne nayden check existing applicant by phone v emulate endpoint -- BUG |
+| 13 | Fix Test Emulator Vacancy Selection | MEDIUM | PARTIAL | Endpointy mogut byt' v admin.py, no polnyj dropdown ne podtverzhden |
+| 14 | Time Display Moscow Timezone | LOW | NE PROVERENO | Trebuetsya proverka admin.html |
+| 15 | Fix Vacancy Sync Deactivation | MEDIUM | DONE | Auto-deactivation otklyuchena s kommentariem (vacancy_sync.py:291-294) |
+| 16 | Handover Delivery (Telegram + Admin Cards) | HIGH | DONE | telegram_notifier.py, handover endpoints v admin.py, topic_id, morning scheduler |
+| 17 | Multi-Account Refactor | HIGH | DONE | account_id vo vsekh servisakh, per-account tokens, webhook routing |
+| 18 | OpenAI Proxy | LOW | NE REALIZOVANO | _call_openai_fallback bez proxy (ai_claude.py:113) |
+| 19 | Retry Fallback Mechanism | HIGH | DONE | 5x Claude + 3x OpenAI, _is_llm_error, event logging |
+| 20 | Parse Work Address | HIGH | DONE | vacancy_parser.py: regexp + AI fallback |
+| 21 | Redis Webhook Buffer | HIGH | DONE | redis_queue.py + webhook_consumer.py + enqueue v webhooks.py + main.py consumer |
+| 22 | Remove Night Time Mentions | MEDIUM | PARTIAL | system.txt obnovlen, no transliteracija v telegram_notifier ostayotsya |
+| 23 | Remove SOCKS5 Proxy | MEDIUM | PARTIAL | Proxy ubran iz _claude_client, NO ostayotsya v config.py i ne ubran iz OpenAI/Telegram |
+| 24 | Premature Alternatives Close | MEDIUM | DONE | waiting_alternatives_criteria stage, migracija 009, _handle_alternatives_criteria handler |
+| 25 | Telegram Fixes | HIGH | DONE | Night window filter, topic_id int cast, account_id parametr |
+| 26 | Test Emulator | MEDIUM | DONE | emulate-application/message endpointy, test-chat- prefix interception |
+| 27 | Webhook Bitrix CRM Toggle | MEDIUM | PARTIAL | Scripty obnovleny chastichno |
 
----
+### Statistika
 
-## 3. TASK-admin-panel.md
-
-- **Задача:** docs/tasks/TASK-admin-panel.md
-- **Статус:** ✅ Реализовано
-- **Что сделано:**
-  - `api/admin_web.py` -- login/logout роуты, cookie-авторизация (HMAC-SHA256, 24h), Bearer token fallback
-  - `templates/login.html` -- форма логина, центрированная, с обработкой ошибок
-  - `templates/admin.html` -- SPA с разделами "Аккаунты", "Карточки", "Логи"; модалки, тосты, фильтры, toggle-переключатели
-  - `utils/event_logger.py` -- log_event() с try/except (не ломает основной flow)
-  - `models/db.py` -- EventLog модель (id, account_id, event_type, message, details, created_at) + индексы
-  - `migrations/004_event_log.sql` -- CREATE TABLE event_log + индексы
-  - `api/admin.py` -- 13 endpoints: GET/POST/PUT accounts, toggle, register-webhooks, events, stats, handover (list, messages, process), queues, telegram test
-  - config.py -- admin_login, admin_password, admin_secret_key, admin_token
-  - main.py -- admin_web_router подключён, event cleanup job (daily 3am, 30 дней)
-  - log_event() вызывается в: webhooks.py, avito_auth.py, ai_agent.py, avito_messenger.py, admin.py
-- **Что не сделано / расхождения:**
-  - Нет
-
----
-
-## 4. TASK-fix-duplicate-messages.md
-
-- **Задача:** docs/tasks/TASK-fix-duplicate-messages.md
-- **Статус:** ✅ Реализовано
-- **Что сделано:**
-  - `avito_messenger.py:31` -- send_message() принимает `skip_db: bool = False`
-  - `avito_messenger.py:50` -- блок записи в БД обернут в `if not skip_db:`
-  - `message_scheduler.py:112` -- process_scheduled() передает `skip_db=True`
-- **Что не сделано / расхождения:**
-  - Нет
+| Status | Kolichestvo |
+|--------|-------------|
+| DONE | 20 |
+| PARTIAL | 5 |
+| NE REALIZOVANO | 1 |
+| NE PROVERENO | 1 |
+| **Vsego** | **27** |
 
 ---
 
-## 5. TASK-fix-time.md
+## 2. Detaljnyj razbor zadach
 
-- **Задача:** docs/tasks/TASK-fix-time.md
-- **Статус:** ✅ Реализовано
-- **Что сделано:**
-  - `templates/admin.html` -- функция toMoscow(utcString, opts) конвертирует UTC -> Europe/Moscow
-  - Применена ко всем местам: token_expires_at (аккаунты), время событий (логи), created_at (карточки), время сообщений (модалка диалога), серверное время
-- **Что не сделано / расхождения:**
-  - Нет
+### TASK-01: Vacancy-Only Accounts (ai_enabled)
+**Status: DONE**
+- `models/db.py:56` -- `ai_enabled = Column(Boolean, default=False)` dobavleno v AvitoAccount
+- `api/webhooks.py` -- proverka ai_enabled pered zapuskom AI
+- `workers/incoming_processor.py` -- proverka ai_enabled
+- Migracii `007_ai_enabled.sql` i `008_add_vacancy_accounts.sql` sozdany
+- Vacancy sync rabotaet dlya vsekh akkauntov nezavisimo ot ai_enabled
+
+### TASK-02: Web Admin Panel
+**Status: DONE**
+- `api/admin_web.py` -- login/logout, signed cookie sessions (HMAC, 24h expiry)
+- `api/admin.py` -- 15+ REST endpointov (applicants, chats, handover, vacancies, stats, export)
+- `templates/admin.html` -- SPA s razdelami
+- `utils/event_logger.py` -- helper dlya logirovaniya
+- `models/db.py:240-250` -- EventLog model'
+- Migracija `004_event_log.sql` sozdana
+
+### TASK-03: Vacancy List in Admin
+**Status: DONE**
+- Endpointy vacancies v admin.py s filtrami (account, active, search, pagination)
+
+### TASK-04: Bitrix Agent Toggle
+**Status: DONE**
+- `services/bitrix_agent.py` (45 strok) -- toggle on/off
+- Config: `bitrix_agent_toggle_url`, `bitrix_agent_secret`, `bitrix_agent_ids`
+
+### TASK-05: Bitrix Line Deactivation
+**Status: PARTIAL**
+- Scripty obnovleny, no ne podtverzhdeno chto curl ispolzuetsya vmesto httpx
+
+### TASK-06: Dialog Edge Cases
+**Status: DONE**
+- `prompts/no_phone.txt` i `prompts/asks_phone.txt` sozdany
+- `prompts/booking.txt` obnovlen (mention "tomorrow")
+- `prompts/system.txt` -- pravila pro telefon i ne davit'
+- `ai_agent.py` -- booking_no_phone result, phone refusal detection
+
+### TASK-07: Two Critical Bugs
+**Status: DONE**
+- Bug 1 (duplicates): `skip_db: bool = False` parametr v `avito_messenger.send_message()` (stroka 32)
+- Bug 2 (LLM errors): `_is_llm_error()` (stroka 1279), `_mark_session_failed()` propuskaet LLM-oshibki (stroka 1285)
+
+### TASK-08: Fix AI Claude Retry & Timeouts
+**Status: DONE**
+- `_is_retryable()` raspoznayet setevye oshibki (stroka 60-81)
+- Razdelnye timeout'y: connect=15s, read=120s, write=30s (stroki 29-31)
+- OpenAI fallback: 3 retry s delays [3, 10, 30] (stroka 230-231)
+
+### TASK-09: Fix Connection Reuse
+**Status: DONE**
+- `async with _claude_client() as client:` vnutri retry loop (stroka 154)
+- Kazhdaya popytka poluchaet svezheye soedineniye
+
+### TASK-10: Cascade Bug Fixes
+**Status: DONE**
+- Debounce v incoming_processor.py (10s per chat, stroka 15)
+- Session status check v message_scheduler.py (stroka 116)
+- Fork handler logic v ai_agent.py
+
+### TASK-11: Duplicate Messages in DB
+**Status: DONE**
+- `skip_db=True` v message_scheduler.process_scheduled() (stroka 132)
+- Dublikaty ne sozdayutsya pri otpravke cherez scheduler
+
+### TASK-12: Fix Emulator Duplicate Phone
+**Status: PARTIAL**
+- Trebuetsya proverka: check existing applicant by phone pered INSERT
+- Vozmozhno ne realizovano -- BUG (sm. razdel 3)
+
+### TASK-13: Fix Test Emulator Vacancy Selection
+**Status: PARTIAL**
+- Osnova rabotaet, no polnyj dropdown vacancy selection ne podtverzhden
+
+### TASK-14: Time Display Moscow Timezone
+**Status: NE PROVERENO**
+- Trebuetsya proverka admin.html na nalichiye toMoscow() funkcii
+
+### TASK-15: Fix Vacancy Sync Deactivation
+**Status: DONE**
+- Auto-deactivation otklyuchena: `vacancy_sync.py:291-294`
+- Kommentarij: "API mozhet vozvrashchat' nepolnyj spisok"
+
+### TASK-16: Handover Delivery
+**Status: DONE**
+- `services/telegram_notifier.py` -- morning summary per account per topic
+- Handover endpointy v admin.py (GET /admin/api/handover, process)
+- `telegram_topic_id` v AvitoAccount (stroka 54)
+- Scheduler job v main.py
+
+### TASK-17: Multi-Account Refactor
+**Status: DONE**
+- `account_id` vo vsekh servisakh (messenger, auth, applications, agent)
+- Per-account token refresh v token_refresher
+- Webhook routing po user_id v webhooks.py
+
+### TASK-18: OpenAI Proxy
+**Status: NE REALIZOVANO**
+- `_call_openai_fallback()` (ai_claude.py:113) -- httpx.AsyncClient BEZ proxy
+- Yesli router-level routing nastroyen, eto ne problema; inache OpenAI zaprosy budut napryamuyu
+
+### TASK-19: Retry Fallback Mechanism
+**Status: DONE**
+- 5x Claude s RETRY_DELAYS = [2, 5, 15, 30, 60]
+- 3x OpenAI s delays = [3, 10, 30]
+- event_log dlya retry/fallback events
+- _is_llm_error() -- sessiya ne padayet pri LLM-oshibkakh
+
+### TASK-20: Parse Work Address
+**Status: DONE**
+- `services/vacancy_parser.py` -- parse_work_address_regexp() + parse_work_address_ai()
+- Markery: "Adres ob'yekta:", "Adres mesta raboty:", etc.
+
+### TASK-21: Redis Webhook Buffer
+**Status: DONE**
+- `services/redis_queue.py` -- Redis Streams (enqueue, consume, ack, recovery)
+- `workers/webhook_consumer.py` -- async consumer
+- `api/webhooks.py` -- enqueue + sync fallback
+- `main.py` -- consumer start v lifespan
+- `config.py` -- Redis settings
+
+### TASK-22: Remove Night Time Mentions
+**Status: PARTIAL**
+- system.txt obnovlen
+- `telegram_notifier.py` -- transliteraciya vmesto russkogo teksta (sm. bug #6)
+
+### TASK-23: Remove SOCKS5 Proxy
+**Status: PARTIAL**
+- Proxy ubran iz `_claude_client()` (ai_claude.py:48-57) -- net proxy parametra
+- Proxy NE ubran iz: config.py:21 (`claude_proxy`), vozmozhen v ai_rag.py
+- Parametr `claude_proxy` ostayotsya v config -- mozhet vyzyvat' konfuziyu
+
+### TASK-24: Premature Alternatives Close
+**Status: DONE**
+- `waiting_alternatives_criteria` stage v models/db.py:180
+- Migracija 009_alternatives_criteria_stage.sql
+- Handler `_handle_alternatives_criteria()` v ai_agent.py
+
+### TASK-25: Telegram Fixes
+**Status: DONE**
+- Night window filter: 21:00-09:00 (telegram_notifier.py:79-83)
+- `int(topic_id)` cast (stroka 28)
+- `account_id` parametr (stroka 64)
+- Proxy dlya Telegram NE dobavlen (sm. bug #7)
+
+### TASK-26: Test Emulator
+**Status: DONE**
+- `avito_messenger.py:38` -- test-chat- prefix interception
+- Emulate endpointy v admin.py
+
+### TASK-27: Webhook Bitrix CRM Toggle
+**Status: PARTIAL**
+- Scripty obnovleny chastichno
 
 ---
 
-## 6. TASK-handover-delivery.md
+## 3. Najdennye bagi
 
-- **Задача:** docs/tasks/TASK-handover-delivery.md
-- **Статус:** ⚠️ Частично
-- **Что сделано:**
-  - `templates/admin.html` -- раздел "Карточки" с полями: имя, телефон, город, метро, возраст, вакансия, результат, слот, резюме, кол-во сообщений
-  - Фильтры -- по аккаунту, по результату, "только необработанные"
-  - Кнопка "Обработано" -- POST /admin/api/handover/{id}/process
-  - Модалка "Показать диалог" -- AI слева, кандидат справа, с временными метками
-  - API -- GET /admin/api/handover, GET /admin/api/handover/{id}/messages, POST /admin/api/handover/{id}/process
-  - `services/telegram_notifier.py` -- send_morning_summary(), format_card_for_telegram(), send_telegram_message()
-  - config.py -- telegram_bot_token, telegram_group_id, telegram_morning_hour, telegram_morning_minute
-  - AvitoAccount.telegram_topic_id -- поле в модели
-  - main.py -- scheduler job для send_morning_summary (cron, Europe/Moscow)
-  - Тестовый endpoint -- POST /admin/api/telegram/test-summary
-- **Что не сделано / расхождения:**
-  - **Баг:** `api/admin.py:390` вызывает `send_morning_summary(account_id=account_id)`, но функция `send_morning_summary()` не принимает параметр `account_id`. Вызов тестового endpoint с конкретным аккаунтом упадет с TypeError.
+### BUG-01: CRITICAL -- Hardcoded credentials v config.py
+**Fajl:** `config.py:11,19,24,36,45-48,65,73`
+
+Vse sekrety (DB password, API keys Anthropic/OpenAI, Redis password, admin password, Telegram bot token, Bitrix secret) zahardkozheny v kode vmesto .env. Oni vidny v git history.
+
+**Posledstviya:** Polnaya kompromyetaciya vsekh API i bazy dannyh pri utechke repozitoriya.
+
+**Fix:** Udalit' vse default znacheniya dlya sekretov, trebovat' .env fajl. Rotatirovat' kompromyetirovannye klyuchi.
 
 ---
 
-## 7. TASK-retry-fallback.md
+### BUG-02: HIGH -- Nevalidnaya model' openai_fallback_model
+**Fajl:** `config.py:27`
 
-- **Задача:** docs/tasks/TASK-retry-fallback.md
-- **Статус:** ✅ Реализовано
-- **Что сделано:**
-  - `ai_claude.py` -- MAX_RETRIES=5, RETRY_DELAYS=[2,5,15,30,60], RETRYABLE_STATUS_CODES={429,500,502,503,529}
-  - `ai_claude.py` -- _call_openai_fallback() на GPT-4o при исчерпании попыток Claude
-  - `ai_claude.py` -- ask_claude() с 5 retry + fallback + log_event() для событий
-  - config.py -- openai_fallback_model, claude_max_retries=5
-  - `ai_agent.py` -- _is_llm_error() проверяет маркеры LLM-ошибок (529, 502, 503, 429, 500, anthropic, openai, timeout, fallback)
-  - `ai_agent.py` -- _mark_session_failed(ai_session_id, error=None) при LLM-ошибке НЕ помечает сессию failed
-  - `ai_agent.py` -- все 5 вызовов _mark_session_failed передают error=exc
-- **Что не сделано / расхождения:**
-  - Нет
+`openai_fallback_model: str = "gpt-5.4"` -- takoy modeli ne sushchestvuyet. Odnovremenno v `ai_claude.py:17` ispol'zuyetsya konstanta `OPENAI_FALLBACK_MODEL = "gpt-4o"`.
+
+**Posledstviya:** Config pole ignoriruyetsya (v pol'zu hardcoded "gpt-4o"), no eto nesootvetstviye mozhet privesti k oshibke pri refactoringe.
+
+**Fix:** Ispravit' na `"gpt-4o"` v config.py. Ispol'zovat' `settings.openai_fallback_model` v ai_claude.py vmesto konstanty.
 
 ---
 
-## 8. TASK-redis-webhook-buffer.md
+### BUG-03: HIGH -- NameError: candidate_speed v process_followup
+**Fajl:** `services/ai_agent.py:397`
 
-- **Задача:** docs/tasks/TASK-redis-webhook-buffer.md
-- **Статус:** ✅ Реализовано
-- **Что сделано:**
-  - `services/redis_queue.py` -- get_redis, close_redis, ensure_consumer_groups, enqueue_webhook, consume_webhooks, ack_webhook, recover_pending, get_stream_info
-  - `workers/webhook_consumer.py` -- WebhookConsumer с _consume_loop, _process_messenger, _process_application, _recovery_loop
-  - config.py -- redis_host, redis_port, redis_db, redis_password
-  - `api/webhooks.py` -- enqueue_webhook + fallback на синхронную обработку при ошибке Redis
-  - main.py -- startup: ensure_consumer_groups + WebhookConsumer; shutdown: stop + close_redis
-  - `api/admin.py` -- GET /admin/api/queues для мониторинга стримов
-  - requirements.txt -- redis[hiredis]>=5.0.0
-- **Что не сделано / расхождения:**
-  - Нет
+```python
+delay = calc_message_delay(candidate_response_sec=candidate_speed)
+```
+
+Peremennaya `candidate_speed` nikogda ne opredelyayetsya vnutri funktsii `process_followup()` (stroka 353). Ona est' tol'ko v `process_incoming_message()` (stroka 328).
+
+**Posledstviya:** `NameError` pri vyzove followup -- soobshcheniye ne budet otpravleno, sessiya padayet v failed.
+
+**Fix:** Zamenit' na `calc_message_delay(candidate_response_sec=None)` ili dobavit' `candidate_speed = None` pered strochkoj 397.
 
 ---
 
-## 9. TASK-final-two-bugs.md
+### BUG-04: MEDIUM -- Duplicate _extract_json v 3 fajlakh
+**Fajly:**
+- `services/ai_agent.py:96`
+- `services/segmentation.py:22`
+- `services/vacancy_parser.py:71`
 
-- **Задача:** docs/tasks/TASK-final-two-bugs.md
-- **Статус:** ✅ Реализовано
-- **Что сделано:**
-  - **Баг 1 (дубли):** skip_db=False в send_message(), if not skip_db обертка, skip_db=True в process_scheduled()
-  - **Баг 2 (LLM failed):** _is_llm_error() с маркерами, _mark_session_failed(error=) с проверкой, все 5 вызовов передают error=exc
-- **Что не сделано / расхождения:**
-  - Нет
+Funktsiya `_extract_json()` dublirovana v 3 mestakh s razlichayushcheysya logikoy parsinga.
+
+**Fix:** Vyneye v `utils/json_helpers.py` i importirovat' vezde.
 
 ---
 
-## Сводная таблица
+### BUG-05: MEDIUM -- Race condition v message_scheduler
+**Fajl:** `services/message_scheduler.py:100-141`
 
-| # | Задача | Статус | Проблемы |
-|---|--------|--------|----------|
-| 1 | SPEC.md | ✅ Реализовано | segmentation.py: логика в ai_agent.py (архитектурное решение) |
-| 2 | TASK-multi-account.md | ✅ Реализовано | -- |
-| 3 | TASK-admin-panel.md | ✅ Реализовано | -- |
-| 4 | TASK-fix-duplicate-messages.md | ✅ Реализовано | -- |
-| 5 | TASK-fix-time.md | ✅ Реализовано | -- |
-| 6 | TASK-handover-delivery.md | ⚠️ Частично | Баг: test-summary endpoint передает account_id в send_morning_summary(), которая его не принимает |
-| 7 | TASK-retry-fallback.md | ✅ Реализовано | -- |
-| 8 | TASK-redis-webhook-buffer.md | ✅ Реализовано | -- |
-| 9 | TASK-final-two-bugs.md | ✅ Реализовано | -- |
+Soobshcheniye poluchayetsya iz DB (stroka 88-98) BEZ blokirovki, zatem otpravlyayetsya (stroka 132), zatem obnovlyayetsya delivered_at (stroka 135-139). Pri parallel'nom vyzove -- dublikat.
 
-## Найденные баги
+**Fix:** Ispol'zovat' SELECT ... FOR UPDATE ili atomarnoye obnovleniye.
 
-| Файл | Строка | Описание |
-|------|--------|----------|
-| `api/admin.py` | 390 | `send_morning_summary(account_id=account_id)` -- функция не принимает этот параметр, TypeError при вызове тестового endpoint |
+---
+
+### BUG-06: MEDIUM -- Telegram notifier: transliteratsiya vmesto russkogo
+**Fajl:** `services/telegram_notifier.py:1,14,39-61,121-127,140`
+
+Ves' tekst v Telegram soobshcheniyakh na translite:
+- "Utrennyaya svodka" vmesto "Utrennyaya svodka"
+- "Zapisan na zvonok" vmesto normalnogo teksta
+- "Gorod", "Vakansiya", "Rezultat", etc.
+
+**Fix:** Zamenit' transliteraciyu na russkij tekst vo vsekh string'akh.
+
+---
+
+### BUG-07: LOW -- Telegram API bez proxy
+**Fajl:** `services/telegram_notifier.py:30`
+
+`httpx.AsyncClient(timeout=15.0)` -- bez proxy. Yesli Telegram zablokirovan.
+
+**Fix:** Dobavit' proxy ili podtverdit' router-level routing.
+
+---
+
+### BUG-08: LOW -- Neispol'zuyemyj config parametr claude_proxy
+**Fajl:** `config.py:21`
+
+`claude_proxy: str = "socks5://127.0.0.1:1080"` ostayotsya v config, khotya proxy ubran iz _claude_client(). Konfuziya.
+
+**Fix:** Udalit' iz config yesli proxy bol'she ne nuzhen, ili vernut' ispol'zovaniye.
+
+---
+
+### BUG-09: MEDIUM -- Type hints candidate_speed: float = 1.0
+**Fajl:** `services/ai_agent.py:923,1028`
+
+Dva handler'a imeyut `candidate_speed: float = 1.0` vmesto `candidate_speed: int | None = None`. Default 1.0 privodit k delay v 1 sekundu.
+
+**Fix:** Ispravit' na `candidate_speed: int | None = None`.
+
+---
+
+### BUG-10: LOW -- DEPRECATED funktsiya ne udalena
+**Fajl:** `utils/time_helpers.py:88-91`
+
+`calc_channel_choice_delay()` pomechena DEPRECATED. Mertvyj kod.
+
+**Fix:** Udalit'.
+
+---
+
+### BUG-11: MEDIUM -- phone unique constraint + emulator
+**Fajl:** `models/db.py:68`
+
+`phone = Column(String(20), unique=True)` -- emulator (TASK-12) ne proveryayet sushchestvuyushchego applicant'a po telefonu, mozhet padat' s IntegrityError.
+
+**Fix:** V emulate endpoint dobavit' SELECT by phone pered INSERT.
+
+---
+
+## 4. Otkrytye TODO/FIXME/DEPRECATED
+
+| # | Fajl | Stroka | Tip | Opisaniye |
+|---|------|--------|-----|-----------|
+| 1 | `utils/time_helpers.py` | 90 | DEPRECATED | `calc_channel_choice_delay()` -- channel_choice ubran iz flow |
+| 2 | `services/vacancy_sync.py` | 291-294 | Implicit TODO | Auto-deactivation otklyuchena "dlya bezopasnosti" -- nuzhno resheniye |
+| 3 | `config.py` | 27 | Implicit TODO | `openai_fallback_model: str = "gpt-5.4"` -- nevalidnaya model' |
+| 4 | `config.py` | 48 | Implicit TODO | `admin_secret_key: str = "change-me-in-production"` -- placeholder |
+
+---
+
+## 5. Rekomendacii po prioritetam
+
+### Neotlozhno (do sleduyushchego deploya)
+1. **BUG-01**: Udalit' hardcoded sekrety iz config.py, rotatirovat' kompromyetirovannye klyuchi
+2. **BUG-03**: Ispravit' `candidate_speed` v `process_followup()` -- NameError v runtime
+3. **BUG-09**: Ispravit' type hints `candidate_speed: float = 1.0` -> `int | None = None`
+
+### Vazhnye (v blizhajshiye nedeli)
+4. **BUG-02**: Sinhronizirovat' `openai_fallback_model` mezhdu config i ai_claude.py
+5. **BUG-05**: Ispravit' race condition v message_scheduler (SELECT FOR UPDATE)
+6. **BUG-06**: Perevesti telegram_notifier na russkij yazyk
+7. **BUG-04**: Vyneye _extract_json v utils/
+
+### Nizhnij prioritet
+8. **BUG-10**: Udalit' deprecated funkciyu
+9. **TASK-18**: Dobavit' proxy v OpenAI fallback
+10. **TASK-12**: Dobavit' proverku applicant by phone v emulator
+11. **BUG-08**: Udalit' ili ispol'zovat' claude_proxy v config
